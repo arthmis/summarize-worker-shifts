@@ -1,27 +1,28 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    io::BufReader,
+    io::{BufReader, Write},
     path::{Path, PathBuf},
     str::FromStr,
 };
 
+use anyhow::{Context, Error};
 use chrono::{DateTime, Datelike, Days, NaiveDate, Timelike, Utc};
 use chrono_tz::US::Central;
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug)]
 struct RawEmployeeShift {
-    #[serde(alias = "ShiftID")]
+    #[serde(rename(deserialize = "ShiftID"))]
     shift_id: u64,
-    #[serde(alias = "EmployeeID")]
+    #[serde(rename(deserialize = "EmployeeID"))]
     employee_id: u64,
-    #[serde(alias = "StartTime")]
+    #[serde(rename(deserialize = "StartTime"))]
     start_time: String,
-    #[serde(alias = "EndTime")]
+    #[serde(rename(deserialize = "EndTime"))]
     end_time: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct EmployeeShift {
     shift_id: u64,
     employee_id: u64,
@@ -29,70 +30,75 @@ struct EmployeeShift {
     end_time: DateTime<Utc>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug)]
 struct EmployeeShiftSummary {
+    #[serde(rename(serialize = "EmployeeID"))]
     employee_id: u64,
+    #[serde(rename(serialize = "StartOfWeek"))]
     start_of_week: String,
+    #[serde(rename(serialize = "RegularHours"))]
     regular_hours: f64,
+    #[serde(rename(serialize = "OvertimeHours"))]
     overtime_hours: f64,
+    #[serde(rename(serialize = "InvalidShifts"))]
     invalid_shifts: Vec<u64>,
 }
 
-fn main() {
-    let path = PathBuf::from_str("./test_dataset_multiple.json").unwrap();
-    // let path = PathBuf::from_str("./dataset_(1).json").unwrap();
-    let shifts = read_shifts(&path);
-    // shifts.first().unwrap().start_time.timezone();
+fn main() -> Result<(), Error> {
+    let path = PathBuf::from_str("./dataset_(1).json")?;
+    let shifts = read_shifts(&path)?;
 
-    summarize_all_employee_hours(shifts);
+    let summaries = summarize_all_employee_hours(shifts);
+    let mut summaries: Vec<EmployeeShiftSummary> = summaries.into_values().collect();
+    calculate_overtime_hours(&mut summaries);
+
+    let mut file = std::fs::File::create("./employee_summaries").unwrap();
+    file.write_all(serde_json::to_string_pretty(&summaries)?.as_bytes())?;
+
+    Ok(())
 }
 
-fn read_shifts(path: &Path) -> Vec<EmployeeShift> {
-    let file = std::fs::File::open(path).unwrap();
+fn read_shifts(path: &Path) -> Result<Vec<EmployeeShift>, Error> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open file: {}", path.to_string_lossy()))?;
+
     let reader = BufReader::new(file);
-    let raw_shifts: Vec<RawEmployeeShift> = serde_json::from_reader(reader).unwrap();
+    let raw_shifts: Vec<RawEmployeeShift> = serde_json::from_reader(reader).with_context(|| {
+        "serde library has a bug when reporting the correct line number where error occurred. Reported error line will be wrong but the actual error will probably be on a nearby line"
+    })?;
 
-    raw_shifts
+    Ok(raw_shifts
         .into_iter()
-        .map(|shift| validate_shift(&shift))
-        .collect()
+        .map(|shift| validate_shift(&shift).unwrap())
+        .collect())
 }
 
-fn validate_shift(shift: &RawEmployeeShift) -> EmployeeShift {
-    dbg!(DateTime::parse_from_rfc3339(&shift.start_time).unwrap());
-    dbg!(DateTime::parse_from_rfc3339(&shift.end_time).unwrap());
-
-    EmployeeShift {
+// would add validation to check end time is after start time
+fn validate_shift(shift: &RawEmployeeShift) -> Result<EmployeeShift, Error> {
+    Ok(EmployeeShift {
         shift_id: shift.shift_id,
         employee_id: shift.employee_id,
         start_time: DateTime::parse_from_rfc3339(&shift.start_time)
-            .unwrap()
+            .with_context(|| format!("start time was not rfc3339 compliant: {:?}", shift))?
             .into(),
         end_time: DateTime::parse_from_rfc3339(&shift.end_time)
-            .unwrap()
+            .with_context(|| format!("end time was not rfc3339 compliant: {:?}", shift))?
             .into(),
+    })
+}
+
+fn calculate_overtime_hours(summaries: &mut [EmployeeShiftSummary]) {
+    for summary in summaries.iter_mut() {
+        if summary.regular_hours > 40. {
+            summary.overtime_hours = summary.regular_hours - 40.;
+            summary.regular_hours = 40.;
+        }
     }
 }
 
-// what about shift that starts saturday and ends sunday?
-fn summarize_employee_hours(employee_id: u64) -> EmployeeShiftSummary {
-    todo!()
-}
-// {
-//     "ShiftID": 26629382113,
-//     "EmployeeID": 34009849,
-//     "StartTime": "2021-08-25T22:00:00.000000Z",
-//     "EndTime": "2021-08-26T11:30:00.000000Z"
-// },
-// loop through all of the shifts
-// figure out if shift is valid
-// add shift_id it to invalid shift field array for the week of the shift
-// get the start of the shift and end of shift dates
-// if end of shift isn't the same week as start of shift then split hours between weeks
-// when splitting hours, add the shift that moved to the next week to its appropriate week
-// if a summary doesn't exist, create that summary in a hash table
-// if total hours is greater than 40 then add that to overtime for week
-fn summarize_all_employee_hours(shifts: Vec<EmployeeShift>) -> Vec<EmployeeShiftSummary> {
+fn summarize_all_employee_hours(
+    shifts: Vec<EmployeeShift>,
+) -> HashMap<(u64, NaiveDate), EmployeeShiftSummary> {
     let shifts = {
         let mut map = BTreeMap::new();
         for shift in shifts {
@@ -101,39 +107,170 @@ fn summarize_all_employee_hours(shifts: Vec<EmployeeShift>) -> Vec<EmployeeShift
         map
     };
 
-    let summaries: HashMap<(u64, NaiveDate), EmployeeShiftSummary> = HashMap::new();
+    let mut summaries: HashMap<(u64, NaiveDate), EmployeeShiftSummary> = HashMap::new();
     for shift in shifts.values() {
         let (start_of_week_for_start_time, end_of_week_for_start_time, start_of_week_for_end_time) =
             get_start_of_week_for_shift(shift.start_time, shift.end_time);
-        // let end_of_week_for_start_time = get_start_of_week_for_shift(shift.start_time);
-        // let start_of_week_for_end_time = end_of_week_for_start_time;
+
+        if does_shift_overlap_with_another_for_employee(shift, &shifts) {
+            summaries
+                .entry((
+                    shift.employee_id,
+                    NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap(),
+                ))
+                .and_modify(|summary| summary.invalid_shifts.push(shift.shift_id))
+                .or_insert(EmployeeShiftSummary {
+                    employee_id: shift.employee_id,
+                    start_of_week: NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap()
+                    .to_string(),
+                    regular_hours: 0.,
+                    overtime_hours: 0.,
+                    invalid_shifts: vec![shift.shift_id],
+                });
+            continue;
+        }
 
         if start_of_week_for_start_time != start_of_week_for_end_time {
             let hours_first_week = end_of_week_for_start_time - shift.start_time;
-            let hours_second_week = shift.end_time - start_of_week_for_end_time;
+            let hours_next_week = shift.end_time - start_of_week_for_end_time;
 
-            // insert these hours into the summaries map
+            summaries
+                .entry((
+                    shift.employee_id,
+                    NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap(),
+                ))
+                .and_modify(|summary| {
+                    summary.regular_hours += hours_first_week.num_minutes() as f64 / 60.
+                })
+                .or_insert(EmployeeShiftSummary {
+                    employee_id: shift.employee_id,
+                    start_of_week: NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap()
+                    .to_string(),
+                    regular_hours: hours_first_week.num_minutes() as f64 / 60.,
+                    overtime_hours: 0.,
+                    invalid_shifts: vec![],
+                });
+
+            summaries
+                .entry((
+                    shift.employee_id,
+                    NaiveDate::from_ymd_opt(
+                        start_of_week_for_end_time.year(),
+                        start_of_week_for_end_time.month(),
+                        start_of_week_for_end_time.day(),
+                    )
+                    .unwrap(),
+                ))
+                .and_modify(|summary| {
+                    summary.regular_hours += hours_next_week.num_minutes() as f64 / 60.
+                })
+                .or_insert(EmployeeShiftSummary {
+                    employee_id: shift.employee_id,
+                    start_of_week: NaiveDate::from_ymd_opt(
+                        start_of_week_for_end_time.year(),
+                        start_of_week_for_end_time.month(),
+                        start_of_week_for_end_time.day(),
+                    )
+                    .unwrap()
+                    .to_string(),
+                    regular_hours: hours_next_week.num_minutes() as f64 / 60.,
+                    overtime_hours: 0.,
+                    invalid_shifts: vec![],
+                });
         } else {
             let hours = shift.end_time - shift.start_time;
 
-            // insert into summaries map
+            summaries
+                .entry((
+                    shift.employee_id,
+                    NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap(),
+                ))
+                .and_modify(|summary| summary.regular_hours += hours.num_minutes() as f64 / 60.)
+                .or_insert(EmployeeShiftSummary {
+                    employee_id: shift.employee_id,
+                    start_of_week: NaiveDate::from_ymd_opt(
+                        start_of_week_for_start_time.year(),
+                        start_of_week_for_start_time.month(),
+                        start_of_week_for_start_time.day(),
+                    )
+                    .unwrap()
+                    .to_string(),
+                    regular_hours: hours.num_minutes() as f64 / 60.,
+                    overtime_hours: 0.,
+                    invalid_shifts: vec![],
+                });
         }
-        // start_time_week = shift.start_time.date_naive().week() ;
-        // end_time_week =
     }
-    // dbg!(shifts);
-    todo!()
+    summaries
 }
 
-// remember to convert to CDT when calculating start date and end date of a week
+fn does_shift_overlap_with_another_for_employee(
+    shift: &EmployeeShift,
+    shifts: &BTreeMap<(u64, DateTime<Utc>), EmployeeShift>,
+) -> bool {
+    for (_, employee_shift) in shifts.iter().filter(|(key, _)| key.0 == shift.employee_id) {
+        if shift.shift_id != employee_shift.shift_id {
+            if shift.start_time > employee_shift.start_time
+                && shift.start_time < employee_shift.end_time
+            {
+                return true;
+            }
+            if shift.end_time > employee_shift.start_time
+                && shift.end_time < employee_shift.end_time
+            {
+                return true;
+            }
+            if employee_shift.start_time > shift.start_time
+                && employee_shift.start_time < shift.end_time
+            {
+                return true;
+            }
+            if employee_shift.end_time > shift.start_time
+                && employee_shift.end_time < shift.end_time
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn get_start_of_week_for_shift(
     start_time: DateTime<Utc>,
     end_time: DateTime<Utc>,
 ) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
-    let sunday = start_time - Days::new(start_time.weekday().num_days_from_sunday() as u64);
-    let central_time = sunday.with_timezone(&Central);
-    let start_work_week =
-        central_time - Days::new(central_time.weekday().num_days_from_sunday() as u64);
+    // convert to central time before calculating sunday midnight date
+    let start_time_central = start_time.with_timezone(&Central);
+
+    let sunday =
+        start_time_central - Days::new(start_time_central.weekday().num_days_from_sunday() as u64);
+    let start_work_week = sunday - Days::new(sunday.weekday().num_days_from_sunday() as u64);
     let start_work_week_for_start_time = start_work_week
         .with_hour(0)
         .unwrap()
@@ -141,12 +278,15 @@ fn get_start_of_week_for_shift(
         .unwrap()
         .with_second(0)
         .unwrap();
+
     let end_work_week_for_start_time = start_work_week_for_start_time + Days::new(7);
+
     let start_work_week_for_end_time = {
-        let sunday = end_time - Days::new(start_time.weekday().num_days_from_sunday() as u64);
-        let central_time = sunday.with_timezone(&Central);
-        let start_work_week =
-            central_time - Days::new(central_time.weekday().num_days_from_sunday() as u64);
+        // convert to central time before calculating sunday midnight date
+        let end_time_central = end_time.with_timezone(&Central);
+        let sunday =
+            end_time_central - Days::new(end_time_central.weekday().num_days_from_sunday() as u64);
+        let start_work_week = sunday - Days::new(sunday.weekday().num_days_from_sunday() as u64);
         start_work_week
             .with_hour(0)
             .unwrap()
@@ -172,6 +312,135 @@ mod tests {
     use chrono_tz::US::Central;
 
     use super::*;
+
+    #[test]
+    fn test_summarize_all_employees_shifts() {
+        let path = PathBuf::from_str("./test_dataset_multiple.json").unwrap();
+        let shifts = read_shifts(&path).unwrap();
+
+        let summaries = summarize_all_employee_hours(shifts);
+        assert_eq!(
+            summaries
+                .get(&(41488322, NaiveDate::from_ymd_opt(2021, 8, 29).unwrap()))
+                .unwrap()
+                .regular_hours,
+            8.5
+        );
+        assert_eq!(
+            summaries
+                .get(&(34009849, NaiveDate::from_ymd_opt(2021, 8, 22).unwrap()))
+                .unwrap()
+                .regular_hours,
+            12.5
+        );
+        assert_eq!(
+            summaries
+                .get(&(38410756, NaiveDate::from_ymd_opt(2021, 8, 22).unwrap()))
+                .unwrap()
+                .regular_hours,
+            12.5
+        );
+    }
+
+    #[test]
+    fn test_calculate_overtime_hours() {
+        let path = PathBuf::from_str("./test_dataset_overtime_hours.json").unwrap();
+        let shifts = read_shifts(&path).unwrap();
+
+        let summaries = summarize_all_employee_hours(shifts);
+        let mut summaries: Vec<EmployeeShiftSummary> = summaries.into_values().collect();
+        calculate_overtime_hours(&mut summaries);
+
+        let summary_week_06_30_2024_41488322_employee = summaries
+            .iter()
+            .find(|summary| {
+                summary.employee_id == 41488322
+                    && summary.start_of_week
+                        == NaiveDate::from_ymd_opt(2024, 6, 30).unwrap().to_string()
+            })
+            .unwrap();
+        let summary_week_07_07_2024_4148_employee = summaries
+            .iter()
+            .find(|summary| {
+                summary.employee_id == 4148
+                    && summary.start_of_week
+                        == NaiveDate::from_ymd_opt(2024, 7, 7).unwrap().to_string()
+            })
+            .unwrap();
+        let summary_week_07_07_2024_4_employee = summaries
+            .iter()
+            .find(|summary| {
+                summary.employee_id == 4
+                    && summary.start_of_week
+                        == NaiveDate::from_ymd_opt(2024, 7, 7).unwrap().to_string()
+            })
+            .unwrap();
+        let summary_week_07_14_2024_4_employee = summaries
+            .iter()
+            .find(|summary| {
+                summary.employee_id == 4
+                    && summary.start_of_week
+                        == NaiveDate::from_ymd_opt(2024, 7, 14).unwrap().to_string()
+            })
+            .unwrap();
+
+        assert_eq!(summaries.len(), 4);
+        assert_eq!(summary_week_06_30_2024_41488322_employee.regular_hours, 40.);
+        assert_eq!(
+            summary_week_06_30_2024_41488322_employee.overtime_hours,
+            10.
+        );
+        assert_eq!(summary_week_07_07_2024_4148_employee.regular_hours, 28.5);
+        assert_eq!(summary_week_07_07_2024_4148_employee.overtime_hours, 0.);
+        assert_eq!(summary_week_07_07_2024_4_employee.regular_hours, 40.);
+        assert_eq!(summary_week_07_07_2024_4_employee.overtime_hours, 3.5);
+        assert_eq!(summary_week_07_14_2024_4_employee.regular_hours, 4.);
+    }
+
+    #[test]
+    fn test_employee_with_overlapping_shifts() {
+        let path = PathBuf::from_str("./test_dataset_overlapping_shift.json").unwrap();
+        let shifts = read_shifts(&path).unwrap();
+
+        let summaries = summarize_all_employee_hours(shifts);
+        let summary_first_week = summaries
+            .get(&(41488322, NaiveDate::from_ymd_opt(2024, 6, 30).unwrap()))
+            .unwrap();
+        let summary_second_week = summaries
+            .get(&(41488322, NaiveDate::from_ymd_opt(2024, 7, 7).unwrap()))
+            .unwrap();
+
+        assert_eq!(summaries.len(), 2);
+
+        assert_eq!(summary_first_week.regular_hours, 12.5);
+        assert_eq!(&summary_first_week.invalid_shifts, &[2663141019]);
+
+        assert_eq!(summary_second_week.regular_hours, 0.);
+        assert_eq!(&summary_second_week.invalid_shifts, &[2663141013]);
+    }
+
+    #[test]
+    fn test_summarize_all_employees_shifts_crossing_sunday_midnight() {
+        let path = PathBuf::from_str("./test_dataset_shift_crosses_sunday_midnight.json").unwrap();
+        let shifts = read_shifts(&path).unwrap();
+
+        let summaries = summarize_all_employee_hours(shifts);
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(
+            summaries
+                .get(&(41488322, NaiveDate::from_ymd_opt(2024, 6, 30).unwrap()))
+                .unwrap()
+                .regular_hours,
+            17.
+        );
+        assert_eq!(
+            summaries
+                .get(&(41488322, NaiveDate::from_ymd_opt(2024, 7, 7).unwrap()))
+                .unwrap()
+                .regular_hours,
+            16.
+        );
+    }
 
     #[test]
     fn test_get_week_boundaries_for_shift_start_and_end_time() {
@@ -254,7 +523,7 @@ mod tests {
     #[test]
     fn test_read_employee_shift() {
         let path = PathBuf::from_str("./test_dataset.json").unwrap();
-        let shifts = read_shifts(&path);
+        let shifts = read_shifts(&path).unwrap();
 
         assert_eq!(shifts[0].shift_id, 2663141019);
         assert_eq!(shifts[0].employee_id, 41488322);
@@ -276,7 +545,7 @@ mod tests {
     #[test]
     fn test_read_multiple_employee_shifts() {
         let path = PathBuf::from_str("./test_dataset_multiple.json").unwrap();
-        let shifts = read_shifts(&path);
+        let shifts = read_shifts(&path).unwrap();
 
         assert_eq!(shifts.len(), 3);
 
@@ -320,7 +589,7 @@ mod tests {
             end_time: "2021-08-30T21:00:00.000000Z".to_string(),
         }];
 
-        let shift = validate_shift(&shifts[0]);
+        let shift = validate_shift(&shifts[0]).unwrap();
         let expected_start_time: DateTime<Utc> =
             DateTime::parse_from_rfc3339("2021-08-30T12:30:00.000000Z")
                 .unwrap()
@@ -335,19 +604,4 @@ mod tests {
         assert_eq!(shift.start_time, expected_start_time);
         assert_eq!(shift.end_time, expected_end_time);
     }
-
-    // #[test]
-    // fn test_summarize_employee_hours() {
-    //     let path = PathBuf::from_str("./test_dataset.json").unwrap();
-    //     let shifts = read_shifts(&path);
-
-    //     let summary = summarize_employee_hours(shifts[0].employee_id);
-    //     let shift = shifts[0];
-
-    //     assert_eq!(summary.employee_id, shift.employee_id);
-    //     assert_eq!(summary.start_of_week, shift.start_time.iso_week());
-    //     assert_eq!(summary.regular_hours, 9);
-    //     assert_eq!(summary.overtime_hours, 0);
-    //     assert_eq!(summary.invalid_shifts, []);
-    // }
 }
