@@ -253,28 +253,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_summarize_all_employees_shifts() {
+    fn test_summarize_shifts_from_json_file() {
         let path = PathBuf::from_str("./test_datasets/test_dataset_multiple.json").unwrap();
-        let shifts = read_shifts(&path).unwrap();
-
-        let summaries = summarize_all_employee_hours(shifts);
+        let summaries = summarize_shifts_from_json_file(&path).unwrap();
         assert_eq!(
             summaries
-                .get(&(41488322, NaiveDate::from_ymd_opt(2021, 8, 29).unwrap()))
+                .iter()
+                .find(|item| item.employee_id == 41488322 && item.start_of_week == *"2021-08-29")
                 .unwrap()
                 .regular_hours,
             8.5
         );
         assert_eq!(
             summaries
-                .get(&(34009849, NaiveDate::from_ymd_opt(2021, 8, 22).unwrap()))
+                .iter()
+                .find(|item| item.employee_id == 34009849 && item.start_of_week == *"2021-08-22")
                 .unwrap()
                 .regular_hours,
             12.5
         );
         assert_eq!(
             summaries
-                .get(&(38410756, NaiveDate::from_ymd_opt(2021, 8, 22).unwrap()))
+                .iter()
+                .find(|item| item.employee_id == 38410756 && item.start_of_week == *"2021-08-22")
                 .unwrap()
                 .regular_hours,
             12.5
